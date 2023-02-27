@@ -18,6 +18,7 @@ package io.cdap.plugin.salesforce.plugin.source.streaming;
 
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
 import io.cdap.plugin.salesforce.authenticator.AuthenticatorCredentials;
+import org.apache.beam.sdk.io.sparkreceiver.HasOffset;
 import org.apache.spark.storage.StorageLevel;
 import org.apache.spark.streaming.receiver.Receiver;
 import org.slf4j.Logger;
@@ -30,7 +31,7 @@ import java.util.concurrent.TimeUnit;
 /**
  * Implementation of Spark receiver to receive Salesforce push topic events
  */
-public class SalesforceReceiver extends Receiver<String> {
+public class SalesforceReceiver extends Receiver<String> implements HasOffset {
   private static final Logger LOG = LoggerFactory.getLogger(SalesforceReceiver.class);
   private static final String RECEIVER_THREAD_NAME = "salesforce_streaming_api_listener";
   // every x seconds thread wakes up and checks if stream is not yet stopped
@@ -39,6 +40,8 @@ public class SalesforceReceiver extends Receiver<String> {
   private final AuthenticatorCredentials credentials;
   private final String topic;
   private SalesforcePushTopicListener pushTopicListener;
+  private Long startOffset = SalesforcePushTopicListener.REPLAY_FROM_TIP;
+  private Long endOffset = Long.MAX_VALUE;
 
   SalesforceReceiver(AuthenticatorCredentials credentials, String topic) {
     super(StorageLevel.MEMORY_AND_DISK_2());
@@ -47,8 +50,26 @@ public class SalesforceReceiver extends Receiver<String> {
   }
 
   @Override
+  public void setStartOffset(Long startOffset) {
+    if (startOffset != null) {
+      if (startOffset == 0) {
+        // All events
+        this.startOffset = SalesforcePushTopicListener.REPLAY_FROM_EARLIEST;
+      } else {
+        // Salesforce requires providing exclusive offset, that's why (offset - 1)
+        this.startOffset = startOffset - 1;
+      }
+    }
+  }
+
+  @Override
+  public Long getEndOffset() {
+    return endOffset;
+  }
+
+  @Override
   public void onStart() {
-    pushTopicListener = new SalesforcePushTopicListener(this.credentials, this.topic);
+    pushTopicListener = new SalesforcePushTopicListener(this.credentials, this.topic, this.startOffset);
     pushTopicListener.start();
 
     ThreadFactory namedThreadFactory = new ThreadFactoryBuilder()
@@ -77,6 +98,8 @@ public class SalesforceReceiver extends Receiver<String> {
       // Since it's top level method of thread, we need to log the exception or it will be unseen
       LOG.error(errorMessage, e);
       throw new RuntimeException(errorMessage, e);
+    } finally {
+      pushTopicListener.disconnectStream();
     }
   }
 }

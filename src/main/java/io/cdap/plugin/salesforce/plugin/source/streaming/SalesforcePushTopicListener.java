@@ -38,6 +38,8 @@ import org.slf4j.LoggerFactory;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 
@@ -58,18 +60,30 @@ public class SalesforcePushTopicListener {
 
   private static final int HANDSHAKE_CHECK_INTERVAL_MS = 1000;
 
+  public static final long REPLAY_FROM_EARLIEST = -2L;
+  public static final long REPLAY_FROM_TIP = -1L;
+
   // store message string not JSONObject, since it's not serializable for later Spark usage
   private final BlockingQueue<String> messagesQueue = new LinkedBlockingQueue<>();
 
   private final AuthenticatorCredentials credentials;
   private final String topic;
+  private final ConcurrentMap<String, Long> replay;
+  private final long replayId;
+
   private BayeuxClient bayeuxClient;
 
   private JSONContext.Client jsonContext;
 
-  public SalesforcePushTopicListener(AuthenticatorCredentials credentials, String topic) {
+  public SalesforcePushTopicListener(AuthenticatorCredentials credentials, String topic, long replayId) {
     this.credentials = credentials;
     this.topic = topic;
+    this.replay = new ConcurrentHashMap<>();
+    this.replayId = replayId;
+  }
+
+  public SalesforcePushTopicListener(AuthenticatorCredentials credentials, String topic) {
+    this(credentials, topic, REPLAY_FROM_TIP);
   }
 
   /**
@@ -127,10 +141,13 @@ public class SalesforcePushTopicListener {
     };
 
     // Now set up the Bayeux client itself
-    return new BayeuxClient(oAuthInfo.getInstanceURL() + DEFAULT_PUSH_ENDPOINT, transport);
+    BayeuxClient bayeuxClient = new BayeuxClient(oAuthInfo.getInstanceURL() + DEFAULT_PUSH_ENDPOINT, transport);
+    bayeuxClient.addExtension(new ReplayExtension(replay));
+    return bayeuxClient;
   }
 
   public void createSalesforceListener() throws Exception {
+    replay.clear();
     bayeuxClient = getClient(credentials);
     bayeuxClient.getChannel(Channel.META_HANDSHAKE).addListener
       ((ClientSessionChannel.MessageListener) (channel, message) -> {
@@ -219,6 +236,8 @@ public class SalesforcePushTopicListener {
   }
 
   private void subscribe() {
+    final String topicWithoutQueryString = topicWithoutQueryString(topic);
+    replay.putIfAbsent(topicWithoutQueryString, replayId);
     bayeuxClient.getChannel("/topic/" + topic).subscribe((channel, message) -> {
       LOG.debug("Message : {}", message);
       messagesQueue.add(jsonContext.getGenerator().generate(message.getDataAsMap()));
@@ -228,5 +247,9 @@ public class SalesforcePushTopicListener {
   public void disconnectStream() {
     bayeuxClient.getChannel("/topic/" + topic).unsubscribe();
     bayeuxClient.disconnect();
+  }
+
+  private static String topicWithoutQueryString(String fullTopic) {
+    return "/topic/" + fullTopic.split("\\?")[0];
   }
 }
